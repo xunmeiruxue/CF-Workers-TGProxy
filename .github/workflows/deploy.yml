@@ -1,0 +1,321 @@
+name: Deploy to Cloudflare Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_secrets:
+        description: "用环境变量里的 SECRET / BOOT 覆盖 Worker 上已有的值（会换掉 ?bridge= 签名，旧链接失效）"
+        required: false
+        type: boolean
+        default: false
+      worker_name:
+        description: "Worker 名（留空则用默认 cf-workers-tgproxy）"
+        required: false
+        type: string
+        default: ""
+
+  push:
+    branches: [main]
+    paths:
+      - "telegram_webproxy.js"
+      - "wrangler.toml"
+      - ".github/workflows/deploy.yml"
+
+concurrency:
+  group: cf-workers-tgproxy-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy telegram_webproxy.js
+    runs-on: ubuntu-latest
+
+    env:
+      DEFAULT_WORKER_NAME: cf-workers-tgproxy
+      COMPAT_DATE: "2025-11-04"
+      OP_ENV_ID: cyabk5r5mgusn4s235akppesoq
+      OP_CF_TOKEN_VAR: cloudflare
+      OP_CF_TOKEN_FALLBACK_VAR: cloudflare_workers
+      OP_SECRET_VAR: SECRET
+      OP_BOOT_VAR: BOOT
+      BINDING_SECRET: SECRET
+      BINDING_BOOT: BOOT
+      INPUT_WORKER_NAME: ${{ inputs.worker_name }}
+      FORCE_SECRETS: ${{ inputs.force_secrets || false }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Install 1Password CLI (beta)
+        if: ${{ env.OP_SERVICE_ACCOUNT_TOKEN != '' }}
+        uses: 1password/install-cli-action@v4
+        with:
+          version: latest-beta
+
+      - name: Resolve worker name
+        run: |
+          set -euo pipefail
+          NAME="${INPUT_WORKER_NAME:-}"
+          NAME="${NAME:-$DEFAULT_WORKER_NAME}"
+          case "$NAME" in
+            [a-z0-9]*) ;;
+            *) echo "::error::Worker 名必须以小写字母或数字开头"; exit 1 ;;
+          esac
+          case "$NAME" in
+            *[!a-z0-9-]*) echo "::error::Worker 名只能包含小写字母、数字、连字符"; exit 1 ;;
+          esac
+          if [ "${#NAME}" -gt 63 ]; then
+            echo "::error::Worker 名过长（>63 字符）"
+            exit 1
+          fi
+          echo "WORKER_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "::add-mask::$NAME"
+          echo "==> Worker 名已解析（已加入日志掩码，不回显）"
+
+      - name: Resolve secrets (Cloudflare token + SECRET + BOOT)
+        run: |
+          set -euo pipefail
+
+          echo "::add-mask::$OP_ENV_ID"
+
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+            echo "::error::仓库 secret OP_SERVICE_ACCOUNT_TOKEN 未配置"
+            exit 1
+          fi
+          if ! command -v op >/dev/null 2>&1; then
+            echo "::error::未找到 op CLI，检查 Install 1Password CLI 步骤"
+            exit 1
+          fi
+
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            ops_*) echo "==> token 格式检查通过（ops_ 前缀，长度 ${#OP_SERVICE_ACCOUNT_TOKEN}）" ;;
+            *) echo "::error::token 不是 ops_ 开头（当前长度 ${#OP_SERVICE_ACCOUNT_TOKEN}），可能复制错了内容"; exit 1 ;;
+          esac
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            *[[:space:]]*) echo "::error::token 含空白字符，复制时多半带入了换行或空格"; exit 1 ;;
+          esac
+
+          if ! OP_ERRSHOWN="$(op user get --me 2>&1)"; then
+            echo "::error::service account 认证失败，op 原始输出："
+            echo "$OP_ERRSHOWN"
+            exit 1
+          fi
+
+          SEC_DIR="$(mktemp -d)"
+          chmod 700 "$SEC_DIR"
+          if ! OP_ERR="$(op run --environment "$OP_ENV_ID" -- bash -c 'umask 077
+            printf "%s" "${cloudflare_workers:-}" > "$1/cf_fallback"
+            printf "%s" "${cloudflare:-}"          > "$1/cf_primary"
+            printf "%s" "${SECRET:-}"              > "$1/secret"
+            printf "%s" "${BOOT:-}"                > "$1/boot"' _ "$SEC_DIR" 2>&1)"; then
+            echo "::error::读取环境变量失败，op 原始报错："
+            echo "$OP_ERR"
+            echo "::error::常见原因：service account 创建时未勾选该 Environment 的 Read 权限（此授权创建后不可改，需重建）"
+            rm -rf "$SEC_DIR"
+            exit 1
+          fi
+
+          TOKEN="$(cat "$SEC_DIR/cf_primary" 2>/dev/null || true)"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="$(cat "$SEC_DIR/cf_fallback" 2>/dev/null || true)"
+            echo "==> 使用 Environment 里的 $OP_CF_TOKEN_FALLBACK_VAR 变量"
+          else
+            echo "==> 使用 Environment 里的 $OP_CF_TOKEN_VAR 变量"
+          fi
+          SECRET_VALUE="$(cat "$SEC_DIR/secret" 2>/dev/null || true)"
+          BOOT_VALUE="$(cat "$SEC_DIR/boot" 2>/dev/null || true)"
+          rm -rf "$SEC_DIR"
+
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Environment 里既没有 $OP_CF_TOKEN_VAR 也没有 $OP_CF_TOKEN_FALLBACK_VAR，检查变量名拼写"
+            exit 1
+          fi
+
+          if [[ ! "${SECRET_VALUE,,}" =~ ^([0-9a-f]{32}|(dd|ee|ef)[0-9a-f]{32})$ ]]; then
+            echo "::error::$OP_SECRET_VAR 格式不合法（当前长度 ${#SECRET_VALUE}）：只接受 32 位 hex，或 dd/ee/ef 前缀 + 32 位 hex；字符集仅 0-9a-f"
+            echo "::error::生成方式：openssl rand -hex 16，或 printf 'dd%s' \"\$(openssl rand -hex 16)\""
+            exit 1
+          fi
+          if [ -z "$BOOT_VALUE" ]; then
+            echo "::error::$OP_BOOT_VAR 为空，Worker /health 会返回 500"
+            exit 1
+          fi
+          case "$BOOT_VALUE" in
+            *$'\n'*|*$'\r'*) echo "::error::$OP_BOOT_VAR 含换行，多半是粘贴时带进来的"; exit 1 ;;
+          esac
+          if [ "${#BOOT_VALUE}" -lt 16 ]; then
+            echo "::warning::$OP_BOOT_VAR 只有 ${#BOOT_VALUE} 字符，建议 ≥ 16（openssl rand -hex 24）"
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$SECRET_VALUE"
+          echo "::add-mask::$BOOT_VALUE"
+          {
+            echo "CLOUDFLARE_API_TOKEN=$TOKEN"
+            echo "TG_SECRET=$SECRET_VALUE"
+            echo "TG_BOOT=$BOOT_VALUE"
+          } >> "$GITHUB_ENV"
+
+          echo "==> Cloudflare 令牌、$OP_SECRET_VAR、$OP_BOOT_VAR 已获取"
+
+      - name: Resolve account id
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(curl -sS "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id // empty' || true)"
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::无法获取 account id，请确认令牌具备 Account Settings:Read 权限"
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "==> account id 已解析"
+
+      - name: Check Workers permission
+        run: |
+          set -euo pipefail
+          CODE="$(curl -sS -o /tmp/workers-scripts.json -w '%{http_code}' \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" || echo 000)"
+          case "$CODE" in
+            200)
+              echo "==> 令牌具备 Workers 访问权限，可以部署"
+              ;;
+            *)
+              echo "::error::令牌缺少 Workers 权限（HTTP $CODE），部署一定会失败，已提前拦下"
+              echo "::error::处理方式：Cloudflare 面板 → My Profile → API Tokens → 编辑该令牌 → Permissions 补一条 Account / Workers Scripts / Edit"
+              exit 1
+              ;;
+          esac
+
+      - name: Preflight (语法 + 用真实 SECRET/BOOT 跑一遍 /health)
+        run: |
+          set -euo pipefail
+          cp telegram_webproxy.js "$RUNNER_TEMP/entry.mjs"
+          node --check "$RUNNER_TEMP/entry.mjs"
+          echo "==> 语法检查通过：$(stat -c%s telegram_webproxy.js) 字节"
+
+          cat > "$RUNNER_TEMP/preflight.mjs" <<'EOF'
+          import { pathToFileURL } from 'node:url';
+          const worker = (await import(pathToFileURL(process.argv[2]).href)).default;
+
+          const hit = async (env) => {
+            const res = await worker.fetch(new Request('https://example.com/health'), env);
+            return { status: res.status, body: await res.text() };
+          };
+
+          const bad = await hit({});
+          if (bad.status !== 500) {
+            throw new Error(`缺少变量时 /health 应为 500，实际 ${bad.status} ${bad.body}`);
+          }
+          const good = await hit({ SECRET: process.env.TG_SECRET, BOOT: process.env.TG_BOOT });
+          if (good.status !== 200 || !good.body.includes('"ok":true')) {
+            throw new Error(`变量齐备时 /health 异常：${good.status} ${good.body}`);
+          }
+          console.log('==> 预检通过：当前代码 + 本次读到的 SECRET/BOOT 组合会让 /health 返回 {"ok":true}');
+          EOF
+
+          node "$RUNNER_TEMP/preflight.mjs" "$RUNNER_TEMP/entry.mjs"
+
+      - name: Deploy Worker
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/tgproxy-deploy"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cp telegram_webproxy.js "$WORK/telegram_webproxy.js"
+
+          {
+            printf 'name = "%s"\n' "$WORKER_NAME"
+            printf 'main = "telegram_webproxy.js"\n'
+            printf 'compatibility_date = "%s"\n' "$COMPAT_DATE"
+            printf 'keep_vars = true\n'
+          } > "$WORK/wrangler.toml"
+
+          cd "$WORK"
+          set +o pipefail
+          wrangler deploy 2>&1 | sed -E 's#https?://[^[:space:]]+#<URL 已隐去>#g'
+          STATUS=${PIPESTATUS[0]}
+          set -o pipefail
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::部署失败，退出码 $STATUS"
+            echo "::error::若报 10000 / 9106 之类的认证或权限错误，检查令牌是否具备 Workers Scripts:Edit"
+            exit "$STATUS"
+          fi
+          echo "==> 部署成功"
+
+      - name: Ensure SECRET / BOOT secrets
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/tgproxy-deploy"
+
+          LIST="$(wrangler secret list --name "$WORKER_NAME" --format json 2>/dev/null || echo '[]')"
+          has() { printf '%s' "$LIST" | jq -e --arg n "$1" 'any(.[]?; .name == $n)' >/dev/null 2>&1; }
+
+          ensure_secret() {
+            local name="$1" value="$2"
+            if [ "$FORCE_SECRETS" = "true" ] || ! has "$name"; then
+              printf '%s' "$value" | wrangler secret put "$name" --name "$WORKER_NAME" >/dev/null
+              echo "==> $name 已写入 Worker（加密存储，不回显）"
+            else
+              echo "==> $name 已存在，保留现有值（想用环境里的值覆盖，请手动触发并勾选 force_secrets）"
+            fi
+          }
+
+          ensure_secret "$BINDING_SECRET" "$TG_SECRET"
+          ensure_secret "$BINDING_BOOT" "$TG_BOOT"
+
+      - name: Verify /health
+        run: |
+          set -euo pipefail
+
+          ENABLED="$(curl -sS \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/subdomain" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result.enabled // false' || echo false)"
+          if [ "$ENABLED" != "true" ]; then
+            echo "::warning::该 Worker 未启用 workers.dev 子域，跳过探活（请用你自己的绑定域名验证 /health）"
+            exit 0
+          fi
+
+          SUB="$(curl -sS \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result.subdomain // empty' || true)"
+          if [ -z "$SUB" ]; then
+            echo "::warning::拿不到 account 的 workers.dev 子域，跳过探活"
+            exit 0
+          fi
+
+          URL="https://$WORKER_NAME.$SUB.workers.dev/health"
+          echo "::add-mask::$SUB"
+          echo "::add-mask::$URL"
+          CODE=000
+          for i in 1 2 3 4 5 6; do
+            CODE="$(curl -sS -o "$RUNNER_TEMP/health.json" -w '%{http_code}' --max-time 10 "$URL" || echo 000)"
+            if [ "$CODE" = "200" ]; then break; fi
+            sleep 5
+          done
+          BODY="$(cat "$RUNNER_TEMP/health.json" 2>/dev/null || true)"
+
+          if [ "$CODE" = "200" ] && [[ "$BODY" == *'"ok":true'* ]]; then
+            echo '==> 探活通过：/health 返回 {"ok":true}'
+            exit 0
+          fi
+
+          echo "::error::探活失败（HTTP $CODE，响应：$BODY）"
+          echo "::error::/health 返回 500 说明 Worker 上 SECRET / BOOT 缺失或格式不合法"
+          echo "::error::排查：wrangler secret list --name $WORKER_NAME；或手动触发本工作流并勾选 force_secrets"
+          exit 1
